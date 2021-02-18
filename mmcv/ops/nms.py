@@ -14,13 +14,16 @@ ext_module = ext_loader.load_ext(
 class NMSop(torch.autograd.Function):
 
     @staticmethod
-    def forward(ctx, bboxes, scores, iou_threshold, offset):
+    def forward(ctx, bboxes, scores, iou_threshold, score_threshold, offset):
+        valid_mask = scores > score_threshold
+        bboxes, scores = bboxes[valid_mask], scores[valid_mask]
+
         inds = ext_module.nms(
             bboxes, scores, iou_threshold=float(iou_threshold), offset=offset)
         return inds
 
     @staticmethod
-    def symbolic(g, bboxes, scores, iou_threshold, offset):
+    def symbolic(g, bboxes, scores, iou_threshold, score_threshold, offset):
         from ..onnx import is_custom_op_loaded
         has_custom_op = is_custom_op_loaded()
         if has_custom_op:
@@ -40,8 +43,12 @@ class NMSop(torch.autograd.Function):
             iou_threshold = g.op(
                 'Constant',
                 value_t=torch.tensor([iou_threshold], dtype=torch.float))
+            score_threshold = g.op(
+                'Constant',
+                value_t=torch.tensor([score_threshold], dtype=torch.float))
             nms_out = g.op('NonMaxSuppression', boxes, scores,
-                           max_output_per_class, iou_threshold)
+                max_output_per_class, iou_threshold, score_threshold)
+
             return squeeze(
                 g,
                 select(
@@ -86,8 +93,8 @@ class SoftNMSop(torch.autograd.Function):
         return nms_out
 
 
-@deprecated_api_warning({'iou_thr': 'iou_threshold'})
-def nms(boxes, scores, iou_threshold, offset=0):
+@deprecated_api_warning({'iou_thr': 'iou_threshold', 'score_thr': 'score_threshold'})
+def nms(boxes, scores, iou_threshold, score_threshold, offset=0):
     """Dispatch to either CPU or GPU NMS implementations.
 
     The input can be either torch tensor or numpy array. GPU NMS will be used
@@ -154,7 +161,7 @@ def nms(boxes, scores, iou_threshold, offset=0):
             select = ext_module.nms(*indata_list, **indata_dict)
         inds = order.masked_select(select)
     else:
-        inds = NMSop.apply(boxes, scores, iou_threshold, offset)
+        inds = NMSop.apply(boxes, scores, iou_threshold, score_threshold, offset)
     dets = torch.cat((boxes[inds], scores[inds].reshape(-1, 1)), dim=1)
     if is_numpy:
         dets = dets.cpu().numpy()
@@ -291,7 +298,6 @@ def batched_nms(boxes, scores, idxs, nms_cfg, class_agnostic=False):
     nms_op = eval(nms_type)
 
     split_thr = nms_cfg_.pop('split_thr', 10000)
-    # Won't split to multiple nms nodes when exporting to onnx
     if boxes_for_nms.shape[0] < split_thr or torch.onnx.is_in_onnx_export():
         dets, keep = nms_op(boxes_for_nms, scores, **nms_cfg_)
         boxes = boxes[keep]
